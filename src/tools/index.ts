@@ -21,9 +21,8 @@ export const DEFAULT_SHELL_TIMEOUT_MS = 120_000;
 
 // ---------- path containment ----------
 // The system prompt asks the model to stay inside the project directory, but a
-// prompt is a request, not a control — and `sarvam -p` approves side effects
-// without prompting, so nothing else stands between a poisoned repo and the
-// filesystem. Every path-taking tool resolves through here instead.
+// prompt is a request, not a control. Every file tool resolves through here;
+// run_shell remains an unsandboxed command with the user's permissions.
 //
 // Two checks, because either alone is bypassable:
 //   1. lexical — catches "/etc/passwd" and "../../.ssh/id_rsa"
@@ -42,28 +41,47 @@ export async function resolveInRoot(
     };
   }
 
+  root = path.resolve(root);
   const abs = path.resolve(root, p);
   const outside = `Error: ${p} resolves outside the project root (${root}). Only paths inside the project are allowed.`;
 
-  const rel = path.relative(root, abs);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return { ok: false, error: outside };
+  const isOutside = (rel: string): boolean =>
+    rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+  if (isOutside(path.relative(root, abs))) return { ok: false, error: outside };
+
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(root);
+  } catch {
+    return { ok: false, error: `Error: Cannot verify project root (${root}).` };
+  }
 
   // Walk up to the nearest path that exists, then compare real paths. A new
   // file's parent is what matters for write_file.
   let probe = abs;
   for (;;) {
     try {
+      // lstat sees a dangling symlink even when realpath reports ENOENT.
+      // Skipping that link would let writeFile follow it to an outside target.
+      await fs.lstat(probe);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { ok: false, error: `Error: Cannot verify path ${p}.` };
+      }
+      const parent = path.dirname(probe);
+      if (parent === probe) return { ok: false, error: outside };
+      probe = parent;
+      continue;
+    }
+
+    try {
       const realProbe = await fs.realpath(probe);
-      const realRoot = await fs.realpath(root);
-      const realRel = path.relative(realRoot, realProbe);
-      if (realRel !== "" && (realRel.startsWith("..") || path.isAbsolute(realRel))) {
+      if (isOutside(path.relative(realRoot, realProbe))) {
         return { ok: false, error: outside };
       }
       break;
     } catch {
-      const parent = path.dirname(probe);
-      if (parent === probe) break; // hit the filesystem root; lexical check stands
-      probe = parent;
+      return { ok: false, error: `Error: Cannot verify path ${p}; dangling or unresolved symlinks are not allowed.` };
     }
   }
 
@@ -151,6 +169,10 @@ async function writeFileRun(args: Record<string, unknown>, ctx: ToolCtx): Promis
   );
   if (!ok) return "User declined write_file.";
 
+  // Approval may wait on user input while another process changes the path.
+  const rechecked = await resolveInRoot(ctx.cwd, p);
+  if (!rechecked.ok) return rechecked.error;
+
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, "utf8");
@@ -203,6 +225,9 @@ async function patchRun(args: Record<string, unknown>, ctx: ToolCtx): Promise<st
     `--- ${p}\n- ${oldStr.slice(0, 150)}\n+ ${newStr.slice(0, 150)}`
   );
   if (!ok) return "User declined patch.";
+
+  const rechecked = await resolveInRoot(ctx.cwd, p);
+  if (!rechecked.ok) return rechecked.error;
 
   try {
     // Function replacer, not a string: String.replace() interprets "$&", "$`",

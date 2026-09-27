@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/sarvamai-cli.svg)](https://www.npmjs.com/package/sarvamai-cli)
 
-An open-source agentic CLI coding assistant powered by **Sarvam AI**, built on the official [`sarvamai`](https://www.npmjs.com/package/sarvamai) SDK, with an OpenAI-compatible fallback provider. It reads, writes, and edits files and runs shell commands in your project — confined to the current directory, and in the REPL, with your approval before any side effect. See [Safety model](#safety-model) for what "confined" and "approval" mean exactly, including where approval does *not* apply.
+An open-source agentic CLI coding assistant powered by **Sarvam AI**, built on the official [`sarvamai`](https://www.npmjs.com/package/sarvamai) SDK, with an OpenAI-compatible fallback provider. It reads, writes, and edits files and runs shell commands in your project. File tools check paths against the current directory; shell commands are not sandboxed. In the REPL, side effects require approval by default. See [Safety model](#safety-model) for the controls in each mode.
 
 > **Status: early.** It works and it's published, but it has few users and needs testers more than it needs features. If you try it, [open an issue](https://github.com/indic-ai-contribs/sarvamai-cli/issues) — even "this was confusing" is useful.
 
@@ -29,8 +29,9 @@ Sarvam ships an excellent SDK (`sarvamai` on npm/PyPI) and Agent Skills for host
 
 ### v0.3.0
 - **Security: file tools are now confined to the working directory.** `read_file`,
-  `write_file`, and `patch` refuse absolute paths, `../` traversal, and in-project symlinks
-  pointing outside. Previously the boundary existed only as an instruction in the system
+  `write_file`, and `patch` refuse paths resolving outside, including absolute paths,
+  `../` traversal, and symlink escapes. Dangling and unresolved symlinks are refused,
+  and write paths are checked again after approval. Previously the boundary existed only as an instruction in the system
   prompt, which a model could simply ignore — and `read_file` has no approval prompt, so
   nothing else stood in the way of reading `~/.ssh/id_rsa` or `~/.sarvam/config.json`.
   `~` is now refused rather than silently resolved to a literal `./~/` directory.
@@ -50,7 +51,7 @@ Sarvam ships an excellent SDK (`sarvamai` on npm/PyPI) and Agent Skills for host
 - Added: `run_shell` kills a command after 120s (whole process group) instead of hanging the
   agent forever on `npm start` or `tail -f`.
 - Added: hitting the turn cap now says so instead of returning as though the task finished.
-- Added: a test suite (`npm test`, 32 tests, no new dependencies) and CI on Node 20/22,
+- Added: a test suite (`npm test`, 40 tests, no new dependencies) and CI on Node 20/22,
   including a pack-and-install smoke test of the published binary.
 - Docs: the README claimed approval before *any* side effect. Single-prompt mode has always
   run unattended; that is now documented rather than implied away, and it announces itself.
@@ -233,17 +234,23 @@ All flags:
 | `patch` | prompted in the REPL | Targeted find-and-replace edit on a file |
 | `run_shell` | prompted in the REPL | Run a shell command, return stdout+stderr (killed after 120s) |
 
-All four are confined to the working directory — see below.
+The three file tools check paths against the working directory. `run_shell` starts there
+but can access files elsewhere with your user permissions.
 
 ## Safety model
 
 Two independent controls, and it's worth knowing which one is doing the work.
 
-**1. Directory confinement — always on, every mode.** `read_file`, `write_file`, and `patch`
+**1. File path checks — always on, every mode.** `read_file`, `write_file`, and `patch`
 refuse any path that resolves outside the directory you started in. That covers absolute paths
 (`/etc/passwd`), traversal (`../../.ssh/id_rsa`), and symlinks inside the project pointing out
-of it. `~` is refused rather than expanded. This is enforced in the tool layer, not requested
-in the prompt, so a model that ignores its instructions still can't reach past it.
+of it. Dangling and unresolved symlinks are refused. `~` is refused rather than expanded.
+Writes are checked again after approval. These checks are not an operating-system sandbox:
+another process can still change paths between a check and filesystem access.
+
+**Shell access is unrestricted.** `run_shell` starts in the project directory, but commands
+can read or write elsewhere, access environment variables, and use the network with your
+user permissions. The file path checks do not apply to commands or their child processes.
 
 **2. Approval prompts — interactive REPL only.** In the REPL, `write_file`, `patch`, and
 `run_shell` each ask before running, and a decline is fed back to the model as a tool result so
@@ -251,10 +258,9 @@ it adapts rather than stalls.
 
 **A single prompt runs unattended.** `sarvam "do the thing"` has no interactive turn to prompt
 on, so side effects are approved automatically and reported as they happen; it prints a line
-saying so on the first one. Confinement is what bounds this mode — there is no prompt standing
-between the model and your working directory. Point it at a directory you're willing to have
-edited, and be aware that content the model reads (a README, a dependency's source) is
-untrusted input that can try to steer it.
+saying so on the first one. File path checks still apply, but shell commands run without an
+approval prompt and can access files outside the project. Content the model reads (a README,
+a dependency's source) is untrusted input that can try to steer it.
 
 `read_file` is never gated, so anything readable inside the project can reach the model.
 Don't run it in a directory holding secrets you wouldn't paste into a chat window.
@@ -269,7 +275,7 @@ an older, looser config is tightened automatically on the next run.
   <img alt="Agent loop: you prompt sarvamai-cli, which streams through the sarvamai SDK to sarvam-105b; tool calls pass through an approval gate before any of read_file, write_file, patch or run_shell executes, and the result feeds back into the loop. Declining returns the refusal to the model." src="docs/architecture-light.svg">
 </picture>
 
-In the REPL, every side effect is gated. The model can propose a write, a patch, or a shell command, but nothing touches your disk until you approve it — and a decline is fed back as a tool result so the agent can adapt rather than stall. Single-prompt runs skip the gate by design; in both modes the tools refuse paths outside the working directory. See [Safety model](#safety-model).
+In the REPL, writes, patches, and shell commands ask for approval by default, and a decline is fed back as a tool result so the agent can adapt. `--approve auto` and single-prompt runs skip the gate. In both modes the file tools check paths against the working directory; shell commands are not sandboxed. See [Safety model](#safety-model).
 
 ```
 bin/sarvam.ts        CLI entrypoint — flag parsing, config loading, mode dispatch

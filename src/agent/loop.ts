@@ -32,8 +32,9 @@ WORKING DIRECTORY:
 - You operate relative to: {CWD}
 - Only access files WITHIN this directory. Never access "/", "/app/", "/home/", etc.
 - Use relative paths like "src/index.ts" or "./README.md".
-- This is enforced, not advisory: paths resolving outside the project are refused
-  by the tool, as is "~". If you get that error, the file is genuinely off-limits —
+- File tools check this rule: paths resolving outside the project are refused,
+  as is "~". Shell commands are not sandboxed; keep them inside the project too.
+  If you get a path error, the file is off-limits —
   do not retry with a different spelling of the same path. Tell the user instead.
 
 How to work:

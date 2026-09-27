@@ -44,6 +44,25 @@ describe("resolveInRoot", () => {
     assert.equal(r.ok, true);
   });
 
+  test("allows an in-project name starting with two dots", async () => {
+    const r = await resolveInRoot(root, "..valid/file.ts");
+    assert.equal(r.ok, true);
+  });
+
+  test("allows a symlink whose target stays inside the project", async () => {
+    await fs.symlink(path.join(root, "inside.txt"), path.join(root, "safe-link"));
+    assert.equal((await resolveInRoot(root, "safe-link")).ok, true);
+  });
+
+  test("refuses a missing project root", async () => {
+    assert.equal((await resolveInRoot(path.join(root, "missing-root"), "file.txt")).ok, false);
+  });
+
+  test("refuses a symlink loop instead of trusting its parent", async () => {
+    await fs.symlink("loop-link", path.join(root, "loop-link"));
+    assert.equal((await resolveInRoot(root, "loop-link")).ok, false);
+  });
+
   test("refuses an absolute path outside the root", async () => {
     const r = await resolveInRoot(root, "/etc/passwd");
     assert.equal(r.ok, false);
@@ -89,6 +108,40 @@ describe("read_file containment", () => {
 });
 
 describe("write_file containment", () => {
+  test("refuses a dangling symlink to a new outside file", async () => {
+    const target = path.join(outside, "dangling-target.txt");
+    await fs.symlink(target, path.join(root, "dangling-link"));
+    let approvals = 0;
+    const out = await executeTool("write_file", { path: "dangling-link", content: "escape" }, {
+      cwd: root,
+      approve: async () => { approvals++; return true; },
+    });
+    assert.match(out, /Error:/);
+    assert.equal(approvals, 0);
+    await assert.rejects(fs.stat(target), { code: "ENOENT" });
+  });
+
+  test("refuses a path beneath a dangling directory symlink", async () => {
+    const target = path.join(outside, "missing-directory");
+    await fs.symlink(target, path.join(root, "dangling-dir"));
+    const out = await executeTool("write_file", { path: "dangling-dir/new.txt", content: "escape" }, ctx());
+    assert.match(out, /Error:/);
+    await assert.rejects(fs.stat(target), { code: "ENOENT" });
+  });
+
+  test("rechecks a path changed during approval", async () => {
+    const f = path.join(root, "changed-write.txt");
+    const out = await executeTool("write_file", { path: "changed-write.txt", content: "escape" }, {
+      cwd: root,
+      approve: async () => {
+        await fs.symlink(path.join(outside, "secret.txt"), f);
+        return true;
+      },
+    });
+    assert.match(out, /outside the project root/);
+    assert.equal(await fs.readFile(path.join(outside, "secret.txt"), "utf8"), "SECRET");
+  });
+
   test("refuses to write outside the project", async () => {
     const target = path.join(outside, "written.txt");
     const out = await executeTool(
@@ -102,6 +155,23 @@ describe("write_file containment", () => {
 });
 
 describe("patch", () => {
+  test("rechecks a path changed during approval", async () => {
+    const f = path.join(root, "changed-patch.txt");
+    await fs.writeFile(f, "original");
+    const out = await executeTool("patch", {
+      path: "changed-patch.txt", old_string: "original", new_string: "escape",
+    }, {
+      cwd: root,
+      approve: async () => {
+        await fs.unlink(f);
+        await fs.symlink(path.join(outside, "secret.txt"), f);
+        return true;
+      },
+    });
+    assert.match(out, /outside the project root/);
+    assert.equal(await fs.readFile(path.join(outside, "secret.txt"), "utf8"), "SECRET");
+  });
+
   test("does not interpret $ sequences in the replacement", async () => {
     const f = path.join(root, "dollar.txt");
     await fs.writeFile(f, "const price = 10;", "utf8");

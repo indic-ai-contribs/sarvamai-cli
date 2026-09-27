@@ -273,14 +273,13 @@ export async function runSinglePrompt(
 
   // Single-prompt mode is unattended by design: there is no interactive turn to
   // prompt on, so every side effect is approved automatically and reported
-  // after the fact. Path containment (see resolveInRoot in tools/index.ts) is
-  // what keeps this bounded — it is the only control standing here.
+  // after the fact. File paths are checked, but shell commands are not sandboxed.
   let announcedUnattended = false;
   const approve = async (tool: string, summary: string, _detail: string): Promise<boolean> => {
     if (!announcedUnattended) {
       announcedUnattended = true;
       console.log(
-        `${DIM}unattended mode — side effects run without asking, confined to ${opts.cwd}${RESET}`
+        `${DIM}unattended mode — side effects run without asking; file paths checked against ${opts.cwd}; shell commands are not sandboxed${RESET}`
       );
     }
     const label = summary.length > 60 ? summary.slice(0, 57) + "…" : summary;
