@@ -12,13 +12,29 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
+/**
+ * Approval mode for side-effecting tools.
+ *
+ * "always"/"never" read ambiguously — "never" has always meant "never ask me"
+ * (auto-approve), but "always" reads equally well as "always ask" or "always
+ * approve", and the two call sites in repl.ts had drifted into disagreeing
+ * about it. "auto"/"prompt" say exactly what they do; the old spellings stay
+ * accepted so existing configs and scripts keep working.
+ */
+export type ApproveMode = "always" | "never" | "auto" | "prompt";
+
+/** True when side effects run without asking. Default (undefined) is to prompt. */
+export function isAutoApprove(mode?: ApproveMode): boolean {
+  return mode === "never" || mode === "auto";
+}
+
 export interface Config {
   provider: "sarvam" | "openai";
   sarvam: { apiKey: string; model: string; baseUrl?: string };
   openai: { apiKey: string; model: string; baseUrl?: string };
   temperature?: number;
   reasoning_effort?: "low" | "medium" | "high";
-  approve?: "always" | "never"; // default: prompt every time
+  approve?: ApproveMode; // default: prompt every time
 }
 
 const CONFIG_DIR = path.join(os.homedir(), ".sarvam");
@@ -29,6 +45,11 @@ export async function loadConfig(overrides?: Partial<Config>): Promise<Config> {
   try {
     const raw = await fs.readFile(CONFIG_PATH, "utf8");
     file = JSON.parse(raw);
+    // Retro-tighten configs written before saveConfig set modes explicitly.
+    const st = await fs.stat(CONFIG_PATH);
+    if (st.mode & 0o077) await fs.chmod(CONFIG_PATH, 0o600).catch(() => {});
+    const dirSt = await fs.stat(CONFIG_DIR);
+    if (dirSt.mode & 0o077) await fs.chmod(CONFIG_DIR, 0o700).catch(() => {});
   } catch {
     // No config file — that's fine, we'll rely on env / overrides.
   }
@@ -72,8 +93,14 @@ export async function loadConfig(overrides?: Partial<Config>): Promise<Config> {
 }
 
 export async function saveConfig(cfg: Config): Promise<void> {
-  await fs.mkdir(CONFIG_DIR, { recursive: true });
-  await fs.writeFile(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf8");
+  // This file holds a plaintext API key. Default modes would leave it 0644
+  // inside a 0755 directory — world-readable on any shared machine.
+  await fs.mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await fs.writeFile(CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf8", mode: 0o600 });
+  // mkdir's mode is ignored when the directory already exists, and writeFile's
+  // is ignored when the file does; tighten both explicitly.
+  await fs.chmod(CONFIG_DIR, 0o700).catch(() => {});
+  await fs.chmod(CONFIG_PATH, 0o600).catch(() => {});
 }
 
 export async function initConfigInteractive(): Promise<Config | null> {

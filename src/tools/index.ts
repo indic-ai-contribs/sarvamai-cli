@@ -13,6 +13,79 @@ export type ApprovalFn = (toolName: string, summary: string, detail: string) => 
 export interface ToolCtx {
   cwd: string;
   approve: ApprovalFn;
+  /** Max wall-clock time for a single run_shell command. Default 120s. */
+  shellTimeoutMs?: number;
+}
+
+export const DEFAULT_SHELL_TIMEOUT_MS = 120_000;
+
+// ---------- path containment ----------
+// The system prompt asks the model to stay inside the project directory, but a
+// prompt is a request, not a control. Every file tool resolves through here;
+// run_shell remains an unsandboxed command with the user's permissions.
+//
+// Two checks, because either alone is bypassable:
+//   1. lexical — catches "/etc/passwd" and "../../.ssh/id_rsa"
+//   2. realpath of the nearest existing ancestor — catches a symlink inside the
+//      project that points out of it
+export async function resolveInRoot(
+  root: string,
+  p: string
+): Promise<{ ok: true; abs: string } | { ok: false; error: string }> {
+  // path.resolve() does not expand "~" — it would produce a literal "./~/…"
+  // directory, silently writing somewhere nobody meant. Reject it outright.
+  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
+    return {
+      ok: false,
+      error: `Error: "~" is not expanded. Use a path relative to the project root (${root}) instead.`,
+    };
+  }
+
+  root = path.resolve(root);
+  const abs = path.resolve(root, p);
+  const outside = `Error: ${p} resolves outside the project root (${root}). Only paths inside the project are allowed.`;
+
+  const isOutside = (rel: string): boolean =>
+    rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+  if (isOutside(path.relative(root, abs))) return { ok: false, error: outside };
+
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(root);
+  } catch {
+    return { ok: false, error: `Error: Cannot verify project root (${root}).` };
+  }
+
+  // Walk up to the nearest path that exists, then compare real paths. A new
+  // file's parent is what matters for write_file.
+  let probe = abs;
+  for (;;) {
+    try {
+      // lstat sees a dangling symlink even when realpath reports ENOENT.
+      // Skipping that link would let writeFile follow it to an outside target.
+      await fs.lstat(probe);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { ok: false, error: `Error: Cannot verify path ${p}.` };
+      }
+      const parent = path.dirname(probe);
+      if (parent === probe) return { ok: false, error: outside };
+      probe = parent;
+      continue;
+    }
+
+    try {
+      const realProbe = await fs.realpath(probe);
+      if (isOutside(path.relative(realRoot, realProbe))) {
+        return { ok: false, error: outside };
+      }
+      break;
+    } catch {
+      return { ok: false, error: `Error: Cannot verify path ${p}; dangling or unresolved symlinks are not allowed.` };
+    }
+  }
+
+  return { ok: true, abs };
 }
 
 export interface ToolHandler {
@@ -40,7 +113,9 @@ const readFileDef: ToolDef = {
 
 async function readFileRun(args: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
   const p = String(args.path);
-  const abs = path.resolve(ctx.cwd, p);
+  const resolved = await resolveInRoot(ctx.cwd, p);
+  if (!resolved.ok) return resolved.error;
+  const abs = resolved.abs;
   const offset = Number(args.offset ?? 1);
   const limit = Number(args.limit ?? 500);
 
@@ -82,7 +157,9 @@ const writeFileDef: ToolDef = {
 async function writeFileRun(args: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
   const p = String(args.path);
   const content = String(args.content);
-  const abs = path.resolve(ctx.cwd, p);
+  const resolved = await resolveInRoot(ctx.cwd, p);
+  if (!resolved.ok) return resolved.error;
+  const abs = resolved.abs;
   const preview = content.length > 200 ? content.slice(0, 200) + `… (+${content.length - 200} chars)` : content;
 
   const ok = await ctx.approve(
@@ -91,6 +168,10 @@ async function writeFileRun(args: Record<string, unknown>, ctx: ToolCtx): Promis
     preview
   );
   if (!ok) return "User declined write_file.";
+
+  // Approval may wait on user input while another process changes the path.
+  const rechecked = await resolveInRoot(ctx.cwd, p);
+  if (!rechecked.ok) return rechecked.error;
 
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -123,7 +204,9 @@ async function patchRun(args: Record<string, unknown>, ctx: ToolCtx): Promise<st
   const p = String(args.path);
   const oldStr = String(args.old_string);
   const newStr = String(args.new_string);
-  const abs = path.resolve(ctx.cwd, p);
+  const resolved = await resolveInRoot(ctx.cwd, p);
+  if (!resolved.ok) return resolved.error;
+  const abs = resolved.abs;
 
   let original: string;
   try {
@@ -143,8 +226,15 @@ async function patchRun(args: Record<string, unknown>, ctx: ToolCtx): Promise<st
   );
   if (!ok) return "User declined patch.";
 
+  const rechecked = await resolveInRoot(ctx.cwd, p);
+  if (!rechecked.ok) return rechecked.error;
+
   try {
-    const updated = original.replace(oldStr, newStr);
+    // Function replacer, not a string: String.replace() interprets "$&", "$`",
+    // "$'" and "$1" inside a *string* replacement even when the pattern is a
+    // plain string. Replacing "price" with "$& $&" would write "price price".
+    // A replacer function receives no such treatment.
+    const updated = original.replace(oldStr, () => newStr);
     await fs.writeFile(abs, updated, "utf8");
     return `Patched ${p} (1 replacement).`;
   } catch (err) {
@@ -178,21 +268,61 @@ async function runShellRun(args: Record<string, unknown>, ctx: ToolCtx): Promise
   );
   if (!ok) return "User declined run_shell.";
 
+  const timeoutMs = ctx.shellTimeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
+
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd: ctx.cwd, shell: true, env: process.env });
+    // detached puts the shell in its own process group so a timeout can kill the
+    // whole tree. Killing the shell alone leaves `npm start`-style children
+    // running and holding the pipes open.
+    const detached = process.platform !== "win32";
+    const child = spawn(command, { cwd: ctx.cwd, shell: true, env: process.env, detached });
     let out = "";
+    let timedOut = false;
     const cap = 8000;
 
     const append = (data: Buffer | string) => {
       if (out.length < cap) out += data.toString().slice(0, cap - out.length);
     };
 
+    const killTree = (signal: NodeJS.Signals) => {
+      if (detached && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // group already gone, or we lost the race — fall through
+        }
+      }
+      try {
+        child.kill(signal);
+      } catch {
+        /* already exited */
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree("SIGTERM");
+      // Escalate if it ignores SIGTERM.
+      setTimeout(() => killTree("SIGKILL"), 5_000).unref();
+    }, timeoutMs);
+    timer.unref();
+
     child.stdout.on("data", append);
     child.stderr.on("data", append);
     child.on("close", (code) => {
-      resolve(`${out}${out.length >= cap ? "\n…(truncated)" : ""}${code !== 0 ? `\n[exit: ${code}]` : ""}`);
+      clearTimeout(timer);
+      const truncated = out.length >= cap ? "\n…(truncated)" : "";
+      const timeoutNote = timedOut
+        ? `\n[timed out after ${Math.round(timeoutMs / 1000)}s — process killed. Re-run with a narrower command, or run it yourself outside the agent.]`
+        : "";
+      const exitNote = code !== 0 && !timedOut ? `\n[exit: ${code}]` : "";
+      resolve(`${out}${truncated}${timeoutNote}${exitNote}`);
     });
-    child.on("error", (err) => resolve(`Error: ${err.message}`));
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve(`Error: ${err.message}`);
+    });
   });
 }
 

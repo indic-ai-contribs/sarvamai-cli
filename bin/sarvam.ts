@@ -7,10 +7,10 @@
 //   sarvam "fix the typo in README"     # single prompt, then exit
 //   sarvam --provider openai "..."      # force a provider for this run
 //   sarvam --init                       # create ~/.sarvam/config.json
-//   sarvam --approve never "..."        # auto-approve all tool calls
+//   sarvam --approve auto "..."         # auto-approve all tool calls
 //   sarvam --model sarvam-105b "..."
 
-import { loadConfig, initConfigInteractive, Config } from "../src/config.js";
+import { loadConfig, initConfigInteractive, Config, ApproveMode } from "../src/config.js";
 import { SarvamProvider } from "../src/providers/sarvam.js";
 import { OpenAIProvider } from "../src/providers/openai.js";
 import { startRepl, runSinglePrompt } from "../src/ui/repl.js";
@@ -21,7 +21,7 @@ interface ParsedArgs {
   model?: string;
   baseUrl?: string;
   init?: boolean;
-  approve?: "always" | "never";
+  approve?: ApproveMode;
   temperature?: number;
   reasoningEffort?: "low" | "medium" | "high";
   help?: boolean;
@@ -48,9 +48,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       case "--init":
         args.init = true;
         break;
-      case "--approve":
-        args.approve = argv[++i] as "always" | "never";
+      case "--approve": {
+        const mode = argv[++i];
+        // Validate rather than cast: a typo used to fall through as an unknown
+        // value and silently pick a behaviour the user did not ask for — and
+        // this flag decides whether side effects run unprompted.
+        if (!["auto", "prompt", "always", "never"].includes(mode)) {
+          console.error(`Invalid --approve value: ${mode ?? "(missing)"}. Expected: auto | prompt`);
+          process.exit(1);
+        }
+        args.approve = mode as ApproveMode;
         break;
+      }
       case "--temperature":
       case "-t":
         args.temperature = Number(argv[++i]);
@@ -86,7 +95,10 @@ FLAGS
   -p, --provider <name>           sarvam | openai  (default: from config or env)
   -m, --model <name>              Model name (sarvam-105b, gpt-4o, ...)
       --base-url <url>            Override API base URL (OpenAI provider only)
-      --approve <mode>            always | never  (default: prompt each time)
+      --approve <mode>            auto | prompt  (default: prompt each time)
+                                  auto runs side effects without asking
+                                  ("never"/"always" still accepted: never=auto,
+                                   always=prompt)
   -t, --temperature <n>           Sampling temperature (0–2)
       --reasoning-effort <lvl>    low | medium | high  (Sarvam only, streams thinking tokens)
   -h, --help                      Show this help
@@ -101,7 +113,12 @@ CONFIG
 EXAMPLES
   sarvam "add a .gitignore for a Python project"
   sarvam --provider openai --model gpt-4o "refactor utils.ts"
-  sarvam --approve never "run the tests and report failures"
+  sarvam --approve auto "run the tests and report failures"
+
+NOTE
+  A single prompt (sarvam "...") runs unattended: side effects are approved
+  automatically and reported as they happen. File tools are confined to the
+  current directory in every mode.
 `;
 
 async function main() {

@@ -32,6 +32,10 @@ WORKING DIRECTORY:
 - You operate relative to: {CWD}
 - Only access files WITHIN this directory. Never access "/", "/app/", "/home/", etc.
 - Use relative paths like "src/index.ts" or "./README.md".
+- File tools check this rule: paths resolving outside the project are refused,
+  as is "~". Shell commands are not sandboxed; keep them inside the project too.
+  If you get a path error, the file is off-limits —
+  do not retry with a different spelling of the same path. Tell the user instead.
 
 How to work:
 - Always read a file before editing it. Never guess at content.
@@ -50,7 +54,11 @@ export interface AgentOpts {
   onReasoning?: (chunk: string) => void;  // called with accumulated reasoning per turn
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
   onToolResult?: (name: string, result: string) => void;
+  /** Out-of-band message for the user (e.g. the turn cap was hit). */
+  onNotice?: (message: string) => void;
   maxTurns?: number;
+  /** Max wall-clock time for a single run_shell command. */
+  shellTimeoutMs?: number;
 }
 
 export function buildSystemPrompt(cwd: string): string {
@@ -62,13 +70,18 @@ export async function runAgent(
   userMsg: string,
   opts: AgentOpts
 ): Promise<Message[]> {
-  const ctx: ToolCtx = { cwd: opts.cwd, approve: opts.approve };
+  const ctx: ToolCtx = { cwd: opts.cwd, approve: opts.approve, shellTimeoutMs: opts.shellTimeoutMs };
   const conversation: Message[] = [...messages, { role: "user", content: userMsg }];
   const maxTurns = opts.maxTurns ?? 20;
   let toolsExecuted = 0;
-  const executedCalls: string[] = [];
+  let completed = false;
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Scoped per turn, not per conversation. A conversation-wide set refused
+    // legitimate repeats: "run the tests, fix the failure, run them again" had
+    // its second run_shell("npm test") skipped as a duplicate and the model was
+    // handed the pre-fix result. Within a single turn a repeat is still a loop.
+    const executedCalls: string[] = [];
     let assistantText = "";
     let toolCalls: ToolCallParsed[] = [];
     let textBuffer = "";
@@ -146,6 +159,7 @@ export async function runAgent(
         continue;
       }
 
+      completed = true;
       break;
     }
 
@@ -175,6 +189,13 @@ export async function runAgent(
       });
       toolsExecuted++;
     }
+  }
+
+  // Falling out of the loop without the model choosing to stop means the turn
+  // cap cut the work short. Silence here reads as "task finished".
+  if (!completed) {
+    const notice = `Stopped after ${maxTurns} turns with work still in progress. Re-run with a narrower request, or ask it to continue.`;
+    opts.onNotice?.(notice);
   }
 
   return conversation;

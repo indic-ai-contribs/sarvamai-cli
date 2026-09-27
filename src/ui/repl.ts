@@ -6,6 +6,7 @@ import * as readline from "node:readline";
 import { Message, Provider } from "../types.js";
 import { runAgent, buildSystemPrompt } from "../agent/loop.js";
 import { executeTool } from "../tools/index.js";
+import { ApproveMode, isAutoApprove } from "../config.js";
 
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
@@ -20,7 +21,7 @@ export interface ReplOpts {
   cwd: string;
   temperature?: number;
   reasoning_effort?: "low" | "medium" | "high";
-  approveMode?: "always" | "never";
+  approveMode?: ApproveMode;
 }
 
 export async function startRepl(opts: ReplOpts): Promise<void> {
@@ -100,7 +101,10 @@ export async function startRepl(opts: ReplOpts): Promise<void> {
   });
 
   const approve = async (tool: string, summary: string, _detail: string): Promise<boolean> => {
-    if (opts.approveMode === "never" || opts.approveMode === "always") return true;
+    // Only "never"/"auto" skip the prompt. "always" previously landed here too,
+    // which meant a user asking for the most cautious setting silently got no
+    // prompts at all — the worst possible direction for the flag to fail in.
+    if (isAutoApprove(opts.approveMode)) return true;
     const label = summary.length > 60 ? summary.slice(0, 57) + "…" : summary;
     const ans = await ask(`${YELLOW}▸ ${tool}: ${label} ${DIM}[y/N]${RESET} `);
     if (ans === null) return false; // stdin closed mid-prompt — decline, never assume consent
@@ -225,6 +229,9 @@ export async function startRepl(opts: ReplOpts): Promise<void> {
             process.stdout.write(`\x1b[2;3m${chunk}\x1b[0m`);
           }
         },
+        onNotice: (message) => {
+          process.stdout.write(`\n${YELLOW}${message}${RESET}\n`);
+        },
         onToolCall: (name, args) => {
           const argPreview = JSON.stringify(args).slice(0, 80);
           process.stdout.write(`\n${DIM}▸ ${name}${argPreview !== "{}" ? ` ${argPreview}` : ""}${RESET}`);
@@ -264,8 +271,17 @@ export async function runSinglePrompt(
 ): Promise<void> {
   const history: Message[] = [{ role: "system", content: buildSystemPrompt(opts.cwd) }];
 
+  // Single-prompt mode is unattended by design: there is no interactive turn to
+  // prompt on, so every side effect is approved automatically and reported
+  // after the fact. File paths are checked, but shell commands are not sandboxed.
+  let announcedUnattended = false;
   const approve = async (tool: string, summary: string, _detail: string): Promise<boolean> => {
-    if (opts.approveMode === "never") return true;
+    if (!announcedUnattended) {
+      announcedUnattended = true;
+      console.log(
+        `${DIM}unattended mode — side effects run without asking; file paths checked against ${opts.cwd}; shell commands are not sandboxed${RESET}`
+      );
+    }
     const label = summary.length > 60 ? summary.slice(0, 57) + "…" : summary;
     console.log(`${YELLOW}▸ ${tool}: ${label}${RESET}`);
     return true;
@@ -290,6 +306,7 @@ export async function runSinglePrompt(
           console.log(`${DIM}${preview}${RESET}`);
         }
       },
+      onNotice: (message) => console.error(`${YELLOW}${message}${RESET}`),
     });
     console.log("");
   } catch (err) {

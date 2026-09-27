@@ -1,6 +1,6 @@
 {
   "name": "sarvamai-cli",
-  "version": "0.2.11",
+  "version": "0.3.0",
   "description": "An agentic CLI coding assistant powered by Sarvam AI — built on the official sarvamai SDK, with OpenAI-compatible fallback.",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
   "types": "./dist/src/index.d.ts",
   "files": [
     "dist/",
+    "!dist/test/",
     "README.md",
     "LICENSE",
     "AUTHORS"
@@ -18,6 +19,7 @@
     "build": "tsc",
     "dev": "tsx bin/sarvam.ts",
     "start": "node dist/bin/sarvam.js",
+    "test": "npm run build && node --test dist/test/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
